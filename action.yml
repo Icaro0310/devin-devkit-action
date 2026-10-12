@@ -1,0 +1,138 @@
+name: devin-devkit catalog gate
+description: >-
+  Lint Devin skills and rules in the checkout with devin-skill-catalog
+  (or run an offline G1/G2 gate) and fail the job on FAIL findings.
+  Read-only by design: the action only inspects — it never installs,
+  updates, quarantines or promotes anything; registry mutations are
+  never invoked. Part of the devin-* ecosystem.
+author: Icaro0310
+branding:
+  icon: package
+  color: purple
+inputs:
+  paths:
+    description: >-
+      Space-separated workspace roots, .devin dirs, skill dirs or files
+      to check, relative to the workspace. Defaults to the whole repo.
+    required: false
+    default: "."
+  gate:
+    description: >-
+      Run an offline gate instead of lint: "" (lint, default), "g1"
+      (structural) or "g2" (verifies rubric packs load — needs
+      packs-dir).
+    required: false
+    default: ""
+  packs-dir:
+    description: "(g2 only) devin-evals rubric pack dir to verify loadable"
+    required: false
+    default: ""
+  include-user:
+    description: >-
+      Also scan user-level Devin dirs (~/.devin, ~/.config/devin).
+      Default off — CI checks the checkout only.
+    required: false
+    default: "false"
+  fail-on-warn:
+    description: Also fail when findings are WARN-only. FAIL always fails.
+    required: false
+    default: "false"
+  version:
+    description: "pip specifier for the devin-skill-catalog package"
+    required: false
+    default: "devin-skill-catalog>=0.1,<0.2"
+outputs:
+  verdict:
+    description: "Worst finding status — PASS, WARN or FAIL"
+    value: ${{ steps.gate.outputs.verdict }}
+  findings:
+    description: Total number of lint/gate findings
+    value: ${{ steps.gate.outputs.findings }}
+  failures:
+    description: Number of FAIL findings
+    value: ${{ steps.gate.outputs.failures }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      with:
+        python-version: "3.12"
+    - name: Install devin-skill-catalog
+      shell: bash
+      run: pip install "${{ inputs.version }}"
+    - name: Check catalog
+      id: gate
+      shell: bash
+      env:
+        PATHS_IN: ${{ inputs.paths }}
+        GATE: ${{ inputs.gate }}
+        PACKS_DIR: ${{ inputs.packs-dir }}
+        INCLUDE_USER: ${{ inputs.include-user }}
+      run: |
+        read -ra TARGETS <<< "$PATHS_IN"
+        flags=(--json)
+        [ "$INCLUDE_USER" != "true" ] && flags+=(--no-user)
+        rm -f .devkit-findings-*.json
+        set +e
+        if [ -z "$GATE" ]; then
+          devin-skill-catalog lint "${flags[@]}" "${TARGETS[@]}" > .devkit-findings-0.json
+          rc=$?
+        elif [ "$GATE" = "g1" ] || [ "$GATE" = "g2" ]; then
+          # the gate takes one path per invocation — run per target, merge below
+          i=0; rc=0
+          for t in "${TARGETS[@]}"; do
+            gargs=(gate "$GATE" --json)
+            [ -n "$PACKS_DIR" ] && gargs+=(--packs-dir "$PACKS_DIR")
+            devin-skill-catalog "${gargs[@]}" "$t" > ".devkit-findings-$i.json"
+            this_rc=$?
+            # rc>1 means the tool itself failed; keep the worst
+            [ "$this_rc" -gt "$rc" ] && rc=$this_rc
+            i=$((i+1))
+          done
+        else
+          echo "::error::unknown gate '$GATE' — use '', 'g1' or 'g2'"
+          exit 2
+        fi
+        set -e
+        shopt -s nullglob
+        files=(.devkit-findings-*.json)
+        if [ "${#files[@]}" -eq 0 ] || [ "$rc" -gt 1 ]; then
+          echo "::error::devin-skill-catalog could not run (exit $rc) — tooling/usage failure, not a lint verdict"
+          echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
+          echo "findings=0" >> "$GITHUB_OUTPUT"
+          echo "failures=0" >> "$GITHUB_OUTPUT"
+          exit 2
+        fi
+        python3 - <<'PY'
+        import glob, json, os, sys
+        findings = []
+        for f in sorted(glob.glob(".devkit-findings-*.json")):
+            try:
+                findings += json.load(open(f)).get("findings", [])
+            except (json.JSONDecodeError, OSError):
+                print(f"::error::unreadable findings file {f} — tool output missing, not a lint verdict")
+                sys.exit(3)
+        order = {"PASS": 0, "WARN": 1, "FAIL": 2}
+        worst = max((f["status"] for f in findings), key=order.get, default="PASS")
+        fails = sum(1 for f in findings if f["status"] == "FAIL")
+        warns = sum(1 for f in findings if f["status"] == "WARN")
+        out = open(os.environ["GITHUB_OUTPUT"], "a")
+        out.write(f"verdict={worst}\nfindings={len(findings)}\nfailures={fails}\n")
+        level = {"FAIL": "error", "WARN": "warning"}
+        for f in findings:
+            if f["status"] != "PASS":
+                loc = f"{f['item']}:{f['line']}" if f.get("line") else f["item"]
+                print(f"::{level[f['status']]}::{f['status']} {loc} [{f['check']}] {f['message']}")
+        print(f"::notice::devin-skill-catalog: {len(findings)} finding(s), {fails} FAIL, {warns} WARN — verdict={worst}")
+        PY
+        pyr=$?
+        [ "$pyr" -eq 3 ] && exit 2
+        verdict=$(grep '^verdict=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)
+        if [ "$verdict" = "FAIL" ]; then
+          echo "::error::devin-devkit catalog check: FAIL findings — fix the flagged skills/rules before merging"
+          exit 1
+        fi
+        if [ "$verdict" = "WARN" ] && [ "${{ inputs.fail-on-warn }}" = "true" ]; then
+          echo "::error::devin-devkit catalog check: WARN findings and fail-on-warn is enabled"
+          exit 1
+        fi
