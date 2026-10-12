@@ -50,6 +50,11 @@ With options:
 - `version` — pip specifier (default `devin-skill-catalog>=0.1,<0.2`).
 - outputs: `verdict` (`PASS`/`WARN`/`FAIL`), `findings`, `failures`.
 
+## Platform support
+
+Runs on any GitHub-hosted runner — lint and the offline `g1`/`g2` gates
+need no Devin install; Python 3.12 comes from `actions/setup-python`.
+
 ## Notes
 
 - Read-only by design — lint/gate inspect items and emit findings;
